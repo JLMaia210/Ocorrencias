@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#b42318">
+<title>Ocorrências por concelho</title>
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--ink:#1a1d23;--mute:#667085;--line:#e4e7ec;--acc:#b42318;--ok:#067647}
+  @media (prefers-color-scheme:dark){:root{--bg:#101215;--card:#1a1d23;--ink:#f2f4f7;--mute:#98a2b3;--line:#2b3038;--acc:#f97066;--ok:#47cd89}}
+  *{box-sizing:border-box}
+  body{margin:0;font:15px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink);padding-bottom:env(safe-area-inset-bottom)}
+  header{position:sticky;top:0;z-index:5;background:var(--card);border-bottom:1px solid var(--line);padding:10px 12px}
+  h1{font-size:17px;margin:0 0 6px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+  button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:8px;padding:6px 12px;cursor:pointer}
+  button:active{opacity:.6}
+  #status{font-size:12.5px;color:var(--mute)}
+  #status.err{color:var(--acc)}
+  .filters{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}
+  .filters input{grid-column:1/-1}
+  input,select{font:inherit;width:100%;padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink)}
+  .kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:12px}
+  .kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 10px}
+  .kpi b{display:block;font-size:20px}
+  .kpi span{font-size:12px;color:var(--mute)}
+  .sort{display:flex;gap:6px;padding:0 12px 8px;overflow-x:auto}
+  .sort button{white-space:nowrap;font-size:13px;padding:4px 10px}
+  .sort button.on{background:var(--acc);border-color:var(--acc);color:#fff}
+  main{padding:0 12px 24px}
+  details{background:var(--card);border:1px solid var(--line);border-radius:10px;margin-bottom:6px}
+  summary{display:flex;align-items:center;gap:8px;padding:10px 12px;cursor:pointer;list-style:none}
+  summary::-webkit-details-marker{display:none}
+  .name{flex:1;font-weight:600}
+  .n{font-weight:700;color:var(--acc);min-width:2ch;text-align:right}
+  .sub{font-size:12px;color:var(--mute);white-space:nowrap}
+  .oc{border-top:1px solid var(--line);padding:8px 12px;font-size:13.5px}
+  .oc .t{font-weight:600}
+  .oc .m{color:var(--mute);font-size:12.5px}
+  .pill{display:inline-block;font-size:11.5px;padding:1px 7px;border-radius:99px;border:1px solid var(--line);margin-left:4px}
+  .empty{text-align:center;color:var(--mute);padding:30px 0}
+</style>
+</head>
+<body>
+<header>
+  <h1><span>Ocorrências por concelho</span><button id="refresh">Atualizar</button></h1>
+  <div id="status">A carregar…</div>
+  <div class="filters">
+    <input id="q" type="search" placeholder="Procurar concelho, freguesia ou natureza…" autocomplete="off">
+    <select id="estado"><option value="">Todos os estados</option></select>
+    <select id="natureza"><option value="">Todas as naturezas</option></select>
+  </div>
+</header>
+<div class="kpis">
+  <div class="kpi"><b id="kOc">–</b><span>Ocorrências</span></div>
+  <div class="kpi"><b id="kOp">–</b><span>Operacionais</span></div>
+  <div class="kpi"><b id="kCo">–</b><span>Concelhos</span></div>
+</div>
+<div class="sort" id="sort"></div>
+<main id="list"></main>
+
+<script>
+const BASE = "https://services-eu1.arcgis.com/VlrHb7fn5ewYhX6y/ArcGIS/rest/services/OcorrenciasSite/FeatureServer/0/query";
+const PAGE = 2000, CACHE_KEY = "ocorrencias_cache_v1", MIN_GAP_MS = 30000, AUTO_MS = 5*60*1000;
+let rows = [], lastLoad = 0, loading = false, sortBy = "n", openSet = new Set();
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const num = v => Number.isFinite(+v) ? +v : 0;
+const norm = s => String(s ?? "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+
+function fmtDate(p){
+  const d = p.DataOcorrencia ?? p.DataInicioOcorrencia;
+  if (typeof d === "number" && d > 1e11){
+    return new Date(d).toLocaleString("pt-PT", {day:"2-digit", month:"2-digit", hour:"2-digit", minute:"2-digit"});
+  }
+  return [p.Data, p.Hora].filter(Boolean).join(" ");
+}
+
+async function fetchAll(){
+  const out = [];
+  for (let off = 0; off < 50000; off += PAGE){
+    const url = `${BASE}?where=1%3D1&outFields=*&returnGeometry=false&orderByFields=ID_oc&f=geojson&resultOffset=${off}&resultRecordCount=${PAGE}`;
+    const r = await fetch(url, {cache:"no-store"});
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    if (j.error) throw new Error(j.error.message || "Erro do servidor");
+    const f = j.features || [];
+    for (const x of f) out.push(x.properties);
+    if (f.length < PAGE && !j.exceededTransferLimit) break;
+    if (!f.length) break;
+  }
+  return out;
+}
+
+async function load(force){
+  if (loading) return;
+  if (!force && Date.now() - lastLoad < MIN_GAP_MS) return;
+  loading = true;
+  $("refresh").disabled = true;
+  setStatus("A atualizar…");
+  try{
+    rows = await fetchAll();
+    lastLoad = Date.now();
+    try{ localStorage.setItem(CACHE_KEY, JSON.stringify({t:lastLoad, rows})); }catch(e){}
+    setStatus("Atualizado às " + new Date(lastLoad).toLocaleTimeString("pt-PT") + " · " + rows.length + " registos");
+    fillSelects();
+    render();
+  }catch(e){
+    setStatus("Sem ligação aos dados em direto (" + e.message + ")." + (rows.length ? " A mostrar dados de " + new Date(lastLoad).toLocaleTimeString("pt-PT") + "." : ""), true);
+  }finally{
+    loading = false; $("refresh").disabled = false;
+  }
+}
+
+function setStatus(t, err){ const s=$("status"); s.textContent=t; s.className = err ? "err" : ""; }
+
+function fillSelects(){
+  for (const [id, key, label] of [["estado","EstadoAgrupado","Todos os estados"],["natureza","Natureza","Todas as naturezas"]]){
+    const sel = $(id), cur = sel.value;
+    const vals = [...new Set(rows.map(r => r[key]).filter(Boolean))].sort((a,b)=>a.localeCompare(b,"pt"));
+    sel.innerHTML = `<option value="">${label}</option>` + vals.map(v=>`<option>${esc(v)}</option>`).join("");
+    if (vals.includes(cur)) sel.value = cur;
+  }
+}
+
+function render(){
+  const q = norm($("q").value), es = $("estado").value, na = $("natureza").value;
+  const f = rows.filter(r =>
+    (!es || r.EstadoAgrupado === es) && (!na || r.Natureza === na) &&
+    (!q || norm([r.Concelho, r.Freguesia, r.Localidade, r.Natureza].join(" ")).includes(q)));
+
+  const g = new Map();
+  for (const r of f){
+    const k = r.Concelho || "(sem concelho)";
+    if (!g.has(k)) g.set(k, {name:k, n:0, op:0, items:[]});
+    const o = g.get(k); o.n++; o.op += num(r.Operacionais); o.items.push(r);
+  }
+  const arr = [...g.values()].sort((a,b) =>
+    sortBy === "name" ? a.name.localeCompare(b.name,"pt") : sortBy === "op" ? b.op - a.op || b.n - a.n : b.n - a.n || a.name.localeCompare(b.name,"pt"));
+
+  $("kOc").textContent = f.length;
+  $("kOp").textContent = f.reduce((s,r)=>s+num(r.Operacionais),0);
+  $("kCo").textContent = arr.length;
+
+  $("sort").innerHTML = [["n","Mais ocorrências"],["op","Mais operacionais"],["name","A–Z"]]
+    .map(([k,l])=>`<button data-s="${k}" class="${sortBy===k?"on":""}">${l}</button>`).join("");
+
+  $("list").innerHTML = arr.length ? arr.map(c => `
+    <details data-k="${esc(c.name)}" ${openSet.has(c.name)?"open":""}>
+      <summary><span class="name">${esc(c.name)}</span><span class="sub">${c.op} oper.</span><span class="n">${c.n}</span></summary>
+      ${c.items.sort((a,b)=>num(b.DataOcorrencia)-num(a.DataOcorrencia)).map(r => `
+        <div class="oc">
+          <div class="t">${esc(r.Natureza || "—")}<span class="pill">${esc(r.EstadoOcorrencia || r.EstadoAgrupado || "")}</span></div>
+          <div class="m">${esc(fmtDate(r))} · ${esc([r.Freguesia, r.Localidade].filter(Boolean).join(", "))}</div>
+          <div class="m">${num(r.Operacionais)} operacionais · ${num(r.MeiosTerrestres)} meios terrestres · ${num(r.MeiosAereos)} aéreos</div>
+        </div>`).join("")}
+    </details>`).join("") : '<div class="empty">Sem resultados.</div>';
+}
+
+$("list").addEventListener("toggle", e => {
+  const k = e.target.dataset && e.target.dataset.k; if (!k) return;
+  e.target.open ? openSet.add(k) : openSet.delete(k);
+}, true);
+$("sort").addEventListener("click", e => { const s=e.target.dataset.s; if(s){ sortBy=s; render(); }});
+$("refresh").addEventListener("click", () => load(true));
+let t; $("q").addEventListener("input", () => { clearTimeout(t); t = setTimeout(render, 150); });
+$("estado").addEventListener("change", render);
+$("natureza").addEventListener("change", render);
+
+// Atualiza sempre que a página volta a ficar visível (ex.: voltar ao separador no telemóvel)
+document.addEventListener("visibilitychange", () => { if (!document.hidden) load(false); });
+window.addEventListener("pageshow", () => load(false));
+setInterval(() => { if (!document.hidden) load(true); }, AUTO_MS);
+
+// Mostra logo os últimos dados guardados enquanto carrega os novos
+try{
+  const c = JSON.parse(localStorage.getItem(CACHE_KEY) || "null");
+  if (c && c.rows){ rows = c.rows; lastLoad = 0; fillSelects(); render(); setStatus("Dados guardados de " + new Date(c.t).toLocaleTimeString("pt-PT") + " · a atualizar…"); }
+}catch(e){}
+load(true);
+</script>
+</body>
+</html>
